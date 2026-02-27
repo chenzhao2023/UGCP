@@ -3,11 +3,11 @@ Accurate coronary artery segmentation plays a critical role in coronary artery d
 
 ![Model](fig1.png)
 
-# code training
+# Implementation
 
-# testing
+See `UGCP.py`
 
-# environment
+# Environment
 
 - matplotlib==3.10.8
 - monai==1.5.1
