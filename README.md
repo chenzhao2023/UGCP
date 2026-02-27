@@ -9,14 +9,14 @@ Accurate coronary artery segmentation plays a critical role in coronary artery d
 
 # environment
 
-matplotlib==3.10.8
-monai==1.5.1
-nibabel==5.3.3
-numpy==2.4.2
-pandas==3.0.1
-scikit_learn==1.8.0
-scipy==1.17.1
-simpleitk==2.5.3
-torch==2.9.1
-tqdm==4.66.4
+- matplotlib==3.10.8
+- monai==1.5.1
+- nibabel==5.3.3
+- numpy==2.4.2
+- pandas==3.0.1
+- scikit_learn==1.8.0
+- scipy==1.17.1
+- simpleitk==2.5.3
+- torch==2.9.1
+- tqdm==4.66.4
 
