@@ -1,14 +1,8 @@
 """
-UAFCP-Net (lightweight)
+UGCP network based on a 3D U-Net backbone.
 
-3D U-Net backbone + uncertainty-guided conservative logit refinement.
-
-Key features:
-- Backbone-agnostic refinement module
-- Uncertainty-gated conservative propagation in logit space
-- Edge-aware modulation in decision-aligned feature space
-
-Designed for anonymous open-source release.
+This implementation is intended for binary segmentation and keeps the
+uncertainty-guided conservative propagation stage near logit space.
 """
 
 import torch
@@ -17,45 +11,40 @@ import torch.nn.functional as F
 from monai.networks.nets import UNet
 
 
-# =========================================================
-# Main Network
-# =========================================================
-
-class UAFCPNet(nn.Module):
+class UnetUGCP(nn.Module):
     """
-    UAFCP-Net: 3D UNet + uncertainty-guided conservative refinement.
+    3D U-Net with UGCP refinement for binary segmentation.
 
-    Args:
-        in_channels: input image channels
-        feat_channels: backbone output feature channels
-        use_uccp: enable refinement module
+    - The backbone outputs intermediate feature maps.
+    - Two 1x1 heads project backbone features to:
+      1. binary logits
+      2. decision-aligned 2-channel features
+    - UGCP refinement updates the foreground logit iteratively.
     """
 
     def __init__(
-        self,
-        in_channels=1,
-        feat_channels=64,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
-        norm="INSTANCE",
-        act="RELU",
-        use_uccp=True,
-        uccp_steps=2,
-        uccp_eta=0.3,
-        uccp_u0=0.5,
-        uccp_tau=0.1,
-        uccp_source_term=True,
+            self,
+            in_channels=1,
+            backbone_feat_out_ch=2,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+            norm="INSTANCE",
+            act="RELU",
     ):
         super().__init__()
 
-        self.use_uccp = use_uccp
+        ugcp_steps = 2
+        ugcp_eta = 1.0
+        ugcp_u0 = 0.5
+        ugcp_tau = 0.1
+        self.use_ugcp = True
+        self.ugcp_use_source_term = True
 
-        # backbone
         self.backbone = UNet(
             spatial_dims=3,
             in_channels=in_channels,
-            out_channels=feat_channels,
+            out_channels=backbone_feat_out_ch,
             channels=channels,
             strides=strides,
             num_res_units=num_res_units,
@@ -63,205 +52,201 @@ class UAFCPNet(nn.Module):
             act=act,
         )
 
-        # logit + feature projection
-        self.logit_head = nn.Conv3d(feat_channels, 2, kernel_size=1)
-        self.feat_head = nn.Conv3d(feat_channels, 2, kernel_size=1)
+        self.logit_head = nn.Conv3d(
+            backbone_feat_out_ch,
+            2,
+            kernel_size=1,
+            bias=True,
+        )
+        self.feat_head = nn.Conv3d(
+            backbone_feat_out_ch,
+            2,
+            kernel_size=1,
+            bias=True,
+        )
 
-        # refinement module
-        if self.use_uccp:
-            self.refine = UQFluxRefine(
-                K_steps=uccp_steps,
-                eta=uccp_eta,
-                u0=uccp_u0,
-                tau=uccp_tau,
-                source_term=uccp_source_term,
-                feat_channels=2,
+        if self.use_ugcp:
+            self.ugcp = UQFluxRefine(
+                K_steps=ugcp_steps,
+                eta=ugcp_eta,
+                u0=ugcp_u0,
+                tau=ugcp_tau,
+                source_item=self.ugcp_use_source_term,
+                feat_head_channel=2,
             )
 
     def forward(self, x):
-        feat_backbone = self.backbone(x)
-        feat = self.feat_head(feat_backbone)
-        logits = self.logit_head(feat_backbone)
+        backbone_features = self.backbone(x)  # [B, C, D, H, W]
+        aligned_feat = self.feat_head(backbone_features)  # [B, 2, D, H, W]
+        logits = self.logit_head(backbone_features)  # [B, 2, D, H, W]
 
-        if self.use_uccp:
-            logits = self.refine(logits, feat)
+        if self.use_ugcp:
+            refined_logits = self.ugcp(logits, aligned_feat)
+        else:
+            refined_logits = logits
 
-        return logits
+        return refined_logits
 
-
-# =========================================================
-# UQ-Guided Conservative Refinement
-# =========================================================
 
 class UQFluxRefine(nn.Module):
     """
-    Uncertainty-gated conservative logit refinement.
+    Uncertainty-gated conservative refinement on binary logits.
 
-    Operates in low-dimensional decision-aligned feature space.
+    The module iteratively updates the foreground logit using:
+    - fixed 6-neighborhood aggregation
+    - uncertainty-based directional gates
+    - feature-based edge modulation
     """
 
     def __init__(
-        self,
-        K_steps=2,
-        eta=0.3,
-        u0=0.5,
-        tau=0.1,
-        source_term=True,
-        feat_channels=2,
+            self,
+            K_steps=2,
+            eta=1.0,
+            u0=0.5,
+            tau=0.1,
+            source_item=True,
+            feat_head_channel=2,
     ):
         super().__init__()
-
         self.K_steps = K_steps
         self.eta = eta
         self.u0 = u0
         self.tau = tau
-        self.use_source = source_term
+        self.ugcp_use_source_term = source_item
 
-        self.stencil = DepthwiseStencil3D(1)
-        self.stencil_feat = DepthwiseStencil3D(feat_channels)
-        self.edge_mlp = EdgeMLP(feat_channels)
+        self.stencil = DepthwiseStencil3D(1)  # foreground logit only
+        self.stencil_f = DepthwiseStencil3D(feat_head_channel)  # aligned feature
+        self.edge_mlp = EdgeMLP(feat_head_channel)
 
-    def forward(self, logits0, feat):
-        logits = logits0
+    def forward(self, logits, aligned_feat):
+        """
+        Refine binary logits with uncertainty-guided propagation.
+        """
+        refined_logits = logits
 
         for _ in range(self.K_steps):
+            _, center_uncertainty, _ = evidential_prob_unc(refined_logits)
+            foreground_logit = refined_logits[:, 1:2]
 
-            _, unc_c, _ = evidential_prob_unc(logits)
+            neighbor_foreground_logits = self.stencil(foreground_logit)
+            batch_size, num_neighbors, channels, depth, height, width = (
+                neighbor_foreground_logits.shape
+            )
+            neighbor_fg_flat = neighbor_foreground_logits.view(
+                batch_size * num_neighbors, channels, depth, height, width
+            )
 
-            fg = logits[:, 1:2]
-
-            # neighbor logits
-            nb = self.stencil(fg)
-
-            B, N, C, D, H, W = nb.shape
-            nb_flat = nb.view(B * N, C, D, H, W)
-
-            nb_logits = torch.cat(
-                [torch.zeros_like(nb_flat), nb_flat],
+            neighbor_logits = torch.cat(
+                [torch.zeros_like(neighbor_fg_flat), neighbor_fg_flat],
                 dim=1,
             )
-            _, unc_nb_flat, _ = evidential_prob_unc(nb_logits)
-            unc_nb = unc_nb_flat.view(B, N, 1, D, H, W)
+            _, neighbor_uncertainty_flat, _ = evidential_prob_unc(neighbor_logits)
+            neighbor_uncertainty = neighbor_uncertainty_flat.view(
+                batch_size, num_neighbors, 1, depth, height, width
+            )
 
-            fg_c = fg.unsqueeze(1)
-            unc_c_b = unc_c.unsqueeze(1)
+            center_logit = foreground_logit.unsqueeze(1)
+            center_uncertainty_expanded = center_uncertainty.unsqueeze(1)
 
-            # uncertainty gates
-            gate_in = torch.sigmoid((unc_c_b - unc_nb) / (self.tau + 1e-8))
-            gate_out = torch.sigmoid((unc_nb - unc_c_b) / (self.tau + 1e-8))
+            gate_j2i = torch.sigmoid(
+                (center_uncertainty_expanded - neighbor_uncertainty) / (self.tau + 1e-8)
+            )
+            gate_i2j = torch.sigmoid(
+                (neighbor_uncertainty - center_uncertainty_expanded) / (self.tau + 1e-8)
+            )
 
-            # edge modulation
-            feat_c = feat.unsqueeze(1)
-            feat_nb = self.stencil_feat(feat)
-            phi = self.edge_mlp(feat_c, feat_nb)
-            phi = torch.tanh(phi)
+            center_feat = aligned_feat.unsqueeze(1)
+            neighbor_feat = self.stencil_f(aligned_feat)
+            edge_weight = self.edge_mlp(center_feat, neighbor_feat)
+            edge_weight = torch.tanh(edge_weight)
 
-            # flux
-            flow_in = (gate_in * phi * nb).sum(dim=1)
-            flow_out = (gate_out * fg_c).sum(dim=1)
+            flow_in = (gate_j2i * edge_weight * neighbor_foreground_logits).sum(dim=1)
+            flow_out = (gate_i2j * center_logit).sum(dim=1)
 
-            src_gate = torch.sigmoid((self.u0 - unc_c) / (self.tau + 1e-8))
+            source_gate = torch.sigmoid((self.u0 - center_uncertainty) / (self.tau + 1e-8))
 
-            if self.use_source:
-                fg = (
-                    fg
-                    + self.eta * (flow_in - flow_out)
-                    + self.eta * src_gate * (logits0[:, 1:2] - fg)
+            if self.ugcp_use_source_term:
+                foreground_logit = (
+                        foreground_logit
+                        + self.eta * (flow_in - flow_out)
+                        + self.eta * source_gate * (logits[:, 1:2] - foreground_logit)
                 )
             else:
-                fg = fg + self.eta * (flow_in - flow_out)
+                foreground_logit = foreground_logit + self.eta * (flow_in - flow_out)
 
-            logits = torch.cat([logits[:, 0:1], fg], dim=1)
+            refined_logits = torch.cat([refined_logits[:, 0:1], foreground_logit], dim=1)
 
-        return logits
+        return refined_logits
 
-
-# =========================================================
-# Fixed 6-neighborhood stencil
-# =========================================================
 
 class DepthwiseStencil3D(nn.Module):
-    """Fixed 6-neighborhood depthwise stencil."""
+    """
+    Fixed 3D depthwise stencil that extracts the 6-neighborhood.
+    """
 
     def __init__(self, channels: int):
         super().__init__()
         self.channels = channels
 
         self.conv = nn.Conv3d(
-            channels,
-            channels * 6,
+            in_channels=channels,
+            out_channels=channels * 6,
             kernel_size=3,
             padding=1,
             groups=channels,
             bias=False,
         )
-
         self._init_weights()
-
         for p in self.parameters():
             p.requires_grad_(False)
 
     def _init_weights(self):
         w = torch.zeros((self.channels * 6, 1, 3, 3, 3))
         for c in range(self.channels):
-            b = c * 6
-            w[b + 0, 0, 1, 1, 2] = 1
-            w[b + 1, 0, 1, 1, 0] = 1
-            w[b + 2, 0, 1, 2, 1] = 1
-            w[b + 3, 0, 1, 0, 1] = 1
-            w[b + 4, 0, 2, 1, 1] = 1
-            w[b + 5, 0, 0, 1, 1] = 1
+            base = c * 6
+            w[base + 0, 0, 1, 1, 2] = 1.0
+            w[base + 1, 0, 1, 1, 0] = 1.0
+            w[base + 2, 0, 1, 2, 1] = 1.0
+            w[base + 3, 0, 1, 0, 1] = 1.0
+            w[base + 4, 0, 2, 1, 1] = 1.0
+            w[base + 5, 0, 0, 1, 1] = 1.0
         self.conv.weight.data.copy_(w)
 
     def forward(self, x):
         y = self.conv(x)
-        B, _, D, H, W = y.shape
-        return y.view(B, 6, self.channels, D, H, W)
+        batch_size, _, depth, height, width = y.shape
+        return y.view(batch_size, 6, self.channels, depth, height, width)
 
-
-# =========================================================
-# Edge MLP
-# =========================================================
 
 class EdgeMLP(nn.Module):
-    """Edge-wise modulation in decision-aligned feature space."""
+    """
+    Edge-wise modulation in decision-aligned feature space.
+    """
 
-    def __init__(self, feat_channels):
+    def __init__(self, feat_head_channel):
         super().__init__()
-        self.linear = nn.Linear(feat_channels, 1, bias=False)
-        nn.init.normal_(self.linear.weight, 0.0, 0.01)
+        self.linear = nn.Linear(feat_head_channel, 1, bias=False)
+        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01)
 
-    def forward(self, feat_c, feat_nb):
-        diff = feat_c - feat_nb
-        B, N, C, D, H, W = diff.shape
+    def forward(self, center_feat, neighbor_feat):
+        feat_diff = center_feat - neighbor_feat
+        batch_size, num_neighbors, channels, depth, height, width = feat_diff.shape
+        feat_diff = feat_diff.permute(0, 1, 3, 4, 5, 2).contiguous().view(-1, channels)
+        edge_weight = self.linear(feat_diff)
+        edge_weight = edge_weight.view(
+            batch_size, num_neighbors, depth, height, width, 1
+        ).permute(0, 1, 5, 2, 3, 4)
+        return edge_weight
 
-        diff = diff.permute(0,1,3,4,5,2).contiguous().view(-1, C)
-        phi = self.linear(diff)
-        phi = phi.view(B, N, D, H, W, 1).permute(0,1,5,2,3,4)
 
-        return phi
-
-
-# =========================================================
-# Evidential uncertainty
-# =========================================================
-
-def evidential_prob_unc(logits):
+def evidential_prob_unc(score):
     """
-    Compute evidential probability and uncertainty.
-
-    Returns:
-        prob_fg: foreground probability
-        unc: epistemic uncertainty
-        S: Dirichlet strength
+    Compute foreground probability and evidential uncertainty for binary logits.
     """
-    K = logits.shape[1]
-
-    evidence = F.softplus(logits)
+    num_classes = score.shape[1]
+    evidence = F.softplus(score)
     alpha = evidence + 1.0
-    S = alpha.sum(dim=1, keepdim=True)
-
-    prob_fg = alpha[:, 1:2] / (S + 1e-8)
-    unc = K / (S + 1e-8)
-
-    return prob_fg, unc, S
+    evidence_sum = alpha.sum(dim=1, keepdim=True)
+    prob_fg = alpha[:, 1:2] / (evidence_sum + 1e-8)
+    unc = num_classes / (evidence_sum + 1e-8)
+    return prob_fg, unc, evidence_sum
